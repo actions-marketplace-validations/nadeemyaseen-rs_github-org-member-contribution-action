@@ -11,6 +11,12 @@ const eventPayload = require(process.env.GITHUB_EVENT_PATH)
 const org = core.getInput('org', {required: false}) || eventPayload.organization.login
 const token = core.getInput('token', {required: true})
 
+///////////////// added by nadeem ///////////////////
+const fs = require('fs');
+const readline = require('readline');
+/////////////////////////////////////////////////////
+
+
 // API throttling
 const octokit = new MyOctokit({
   auth: token,
@@ -30,13 +36,96 @@ const octokit = new MyOctokit({
     },
     onAbuseLimit: (retryAfter, options, octokit) => {
       // does not retry, only logs a warning
-      oktokit.log.warn(`Abuse detected for request ${options.method} ${options.url}`)
+      octokit.log.warn(`Abuse detected for request ${options.method} ${options.url}`)
     }
   }
 })
 
+///////////////// added by nadeem ///////////////////////////
+// Query all commits of given user in all Repos of org from given time
+async function getAllBranchComits(uid,from,uniqueOids) {
+  let paginationMember = null
+  const query = `query ($org: String!, $uid: ID, $from: GitTimestamp, $after: String) {
+    organization(login: $org) {
+      repositories(first: 30, after: $after) {
+        nodes {
+          name
+          refs(refPrefix: "refs/heads/", last: 100) {
+            edges {
+              node {
+                name
+                target {
+                  ... on Commit {
+                    history(author: { id: $uid }, since: $from) {
+                      edges {
+                        node {
+                          oid
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }`
+
+  try {
+    let hasNextPageMember = false
+    let getComitResult = null
+
+    do {
+      getComitResult = await octokit.graphql({
+        query,
+        org,
+        uid: uid,
+        from,
+        after: paginationMember
+      })
+
+      //const ComitObj = getComitResult.organization.repositories.nodes
+      hasNextPageMember = getComitResult.organization.repositories.pageInfo.hasNextPage
+      if (hasNextPageMember) {
+        paginationMember = getComitResult.organization.repositories.pageInfo.endCursor
+      } else {
+        paginationMember = null
+      }
+
+      const oidSet = new Set();
+
+      getComitResult.organization.repositories.nodes.forEach((repo) => {
+        repo.refs.edges.forEach((edge) => {
+          if (edge.node.target.history.edges.length > 0) {
+            edge.node.target.history.edges.forEach((historyEdge) => {
+              const oid = historyEdge.node.oid
+              oidSet.add(oid)
+            })
+          }
+        })
+      })
+
+      uniqueOids.push(...Array.from(oidSet))
+
+    } while (hasNextPageMember)
+  } catch (error) {
+    core.setFailed(error.message)
+  }
+  //console.log(uniqueOids);
+
+}
+
+/////////////////////////////////////////////////////////////
+
 // Query all org member contributions
-async function getMemberActivity(orgid, from, to, contribArray) {
+async function getMemberActivity(orgid, from, to,contribArray,uniqueOids) {
+  console.log(`gathering result from the date: ${from}`)
   let paginationMember = null
   const query = `query ($org: String! $orgid: ID $cursorID: String $from: DateTime, $to: DateTime) {
     organization(login: $org ) {
@@ -64,7 +153,8 @@ async function getMemberActivity(orgid, from, to, contribArray) {
   }`
   try {
     let hasNextPageMember = false
-    let getMemberResult = null
+    let getMemberResult = null    
+    let getUserIdResult = null //// added by nadeem
 
     do {
       getMemberResult = await octokit.graphql({
@@ -88,7 +178,28 @@ async function getMemberActivity(orgid, from, to, contribArray) {
 
         const userName = member.login
         const activeContrib = member.contributionsCollection.hasAnyContributions
-        const commitContrib = member.contributionsCollection.totalCommitContributions
+//////////////////////// added by nadeem  ////////////////////////////////////////////
+          try {
+            // Find user id for member
+            const idquery = `query ($username: String!) {
+              user(login: $username) {
+                id
+              }
+            }`
+            getUserIdResult = await octokit.graphql({
+              query: idquery,
+              username: userName
+            })
+          } catch (error) {
+            core.setFailed(error.message)
+          }
+          
+          const id = getUserIdResult.user.id
+          await getAllBranchComits(id,from,uniqueOids)
+        const commitContrib = uniqueOids.length
+        uniqueOids = []
+//////////////////////////////////////////////////////////////////////////
+        //const commitContrib = member.contributionsCollection.totalCommitContributions
         const issueContrib = member.contributionsCollection.totalIssueContributions
         const prContrib = member.contributionsCollection.totalPullRequestContributions
         const prreviewContrib = member.contributionsCollection.totalPullRequestReviewContributions
@@ -137,7 +248,7 @@ async function getMemberActivity(orgid, from, to, contribArray) {
     const re = new RegExp(regex, flags)
 
     if (re.test(fromdate, todate) !== true) {
-      days = core.getInput('days', {required: false}) || '30'
+      days = core.getInput('days', {required: true}) || '30'
       to = new Date()
       from = new Date()
       from.setDate(to.getDate() - days)
@@ -155,8 +266,9 @@ async function getMemberActivity(orgid, from, to, contribArray) {
 
     // Take time, orgid parameters and init array to get all member contributions
     const contribArray = []
+    const uniqueOids = [] 
     console.log(`Retrieving ${logDate} of member contribution data for the ${org} organization:`)
-    await getMemberActivity(orgid, from, to, contribArray)
+    await getMemberActivity(orgid, from, to,contribArray,uniqueOids)
 
     // Set sorting settings and add header to array
     const columns = {
@@ -185,7 +297,8 @@ async function getMemberActivity(orgid, from, to, contribArray) {
     })
 
     // Prepare path/filename, repo/org context and commit name/email variables
-    const reportPath = `reports/${org}-${new Date().toISOString().substring(0, 19) + 'Z'}-${fileDate}.csv`
+    const reportPath = `reports/${org}-${from}-to-${new Date().toISOString().substring(0, 19) + 'Z'}-${fileDate}.csv`
+    //const reportPath = `/tmp/${org}-${new Date().toISOString().substring(0, 19) + 'Z'}-${fileDate}.csv`    
     const committerName = core.getInput('committer-name', {required: false}) || 'github-actions'
     const committerEmail = core.getInput('committer-email', {required: false}) || 'github-actions@github.com'
     const {owner, repo} = github.context.repo
@@ -203,6 +316,7 @@ async function getMemberActivity(orgid, from, to, contribArray) {
       }
     }
 
+    //fs.writeFileSync(reportPath, csv);    
     console.log(`Pushing final CSV report to repository path: ${reportPath}`)
 
     await octokit.rest.repos.createOrUpdateFileContents(opts)
@@ -210,3 +324,4 @@ async function getMemberActivity(orgid, from, to, contribArray) {
     core.setFailed(error.message)
   }
 })()
+
